@@ -1,0 +1,1292 @@
+import pygame
+import sys
+import math
+import random
+import numpy as np
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+# Removed GLUT dependency to avoid crashes
+
+# Initialize Pygame and OpenGL
+pygame.init()
+
+# Constants
+SCREEN_WIDTH = 800
+SCREEN_HEIGHT = 600
+WORLD_SIZE = 75  # 75x75 grid
+FOV = 60  # Field of view in degrees
+MAX_DEPTH = 50  # Maximum render distance
+
+# Colors
+BLACK = (0, 0, 0)
+FLOOR_GREEN = (0.08, 0.4, 0.08, 1.0)  # Dark grass
+WALL_GREEN = (0.04, 0.2, 0.04, 1.0)  # Very dark green for forest
+SKY_COLOR = (0.0, 0.0, 0.05, 1.0)  # Nearly black sky with slight blue tint
+
+# Special value for the arch
+ARCH_TYPE = 3
+
+# Setup display
+screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), DOUBLEBUF | OPENGL)
+pygame.display.set_caption("Fairy Forest - Enhanced 3D")
+clock = pygame.time.Clock()
+
+# OpenGL initialization
+glViewport(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
+glMatrixMode(GL_PROJECTION)
+glLoadIdentity()
+gluPerspective(FOV, (SCREEN_WIDTH / SCREEN_HEIGHT), 0.1, MAX_DEPTH)
+glMatrixMode(GL_MODELVIEW)
+glLoadIdentity()
+glEnable(GL_DEPTH_TEST)
+glEnable(GL_BLEND)
+glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+glEnable(GL_LIGHTING)
+glEnable(GL_LIGHT0)
+glEnable(GL_COLOR_MATERIAL)
+glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+
+# Create textures
+def create_texture(width, height, color_func):
+    texture_data = []
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = color_func(x, y, width, height)
+            texture_data.extend([r, g, b, a])
+    
+    texture_data = np.array(texture_data, dtype=np.uint8)
+    texture_id = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, texture_id)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
+    return texture_id
+
+# Grass texture
+def grass_color(x, y, width, height):
+    # Base green with some variation
+    green = random.randint(80, 120)
+    return (random.randint(10, 30), green, random.randint(10, 40), 255)
+
+# Tree texture
+def tree_color(x, y, width, height):
+    # Dark tree bark with some variation
+    if random.random() < 0.1:  # Occasional lighter streaks
+        return (random.randint(40, 60), random.randint(30, 50), random.randint(20, 30), 255)
+    else:
+        return (random.randint(20, 30), random.randint(15, 25), random.randint(5, 15), 255)
+
+# Create rainbow arch texture with spooky elements
+def arch_color(x, y, width, height):
+    position = y / float(height)  # Normalized position for gradient
+    
+    # Base rainbow colors with spooky twist
+    if position < 0.16:  # Deep purple
+        r, g, b = 70 + random.randint(-10, 10), 0, 90 + random.randint(-10, 10)
+    elif position < 0.33:  # Blood red
+        r, g, b = 150 + random.randint(-10, 10), 0, 30 + random.randint(-10, 10)
+    elif position < 0.5:  # Dark orange
+        r, g, b = 180 + random.randint(-10, 10), 70 + random.randint(-10, 10), 0
+    elif position < 0.66:  # Sickly green
+        r, g, b = 60 + random.randint(-10, 10), 120 + random.randint(-10, 10), 40 + random.randint(-10, 10)
+    elif position < 0.83:  # Deep blue
+        r, g, b = 0, 30 + random.randint(-10, 10), 120 + random.randint(-10, 10)
+    else:  # Dark violet
+        r, g, b = 80 + random.randint(-10, 10), 0, 120 + random.randint(-10, 10)
+    
+    # Add ethereal glow
+    if random.random() > 0.9:
+        glow = random.randint(50, 150)
+        r = min(255, r + glow)
+        g = min(255, g + glow)
+        b = min(255, b + glow)
+    
+    # Add some dark cracks
+    if random.random() > 0.95:
+        r //= 3
+        g //= 3
+        b //= 3
+    
+    # Add transparency for magical effect
+    alpha = 220 + random.randint(-30, 30)
+    return (r, g, b, alpha)
+
+# Create textures
+grass_texture = create_texture(256, 256, grass_color)
+tree_texture = create_texture(256, 256, tree_color)
+arch_texture = create_texture(256, 256, arch_color)
+
+# Player starting position
+player_pos = [WORLD_SIZE / 2, 1.0, WORLD_SIZE / 2]  # [x, y, z]
+player_rot = [0, 0]  # [horizontal, vertical] in degrees
+player_speed = 0.2
+rotation_speed = 2.0
+
+# World generation
+world_map = [[0 for _ in range(WORLD_SIZE)] for _ in range(WORLD_SIZE)]
+
+# Add forest perimeter
+for x in range(WORLD_SIZE):
+    for z in range(WORLD_SIZE):
+        if (x < 5 or x >= WORLD_SIZE - 5 or 
+            z < 5 or z >= WORLD_SIZE - 5):
+            world_map[z][x] = 1  # Forest perimeter
+
+# Place the arch at a fixed position
+arch_center_x = WORLD_SIZE // 4
+arch_center_z = WORLD_SIZE // 4
+arch_width = 5
+arch_height = 7
+
+# Creatures
+class Creature:
+    def __init__(self, x, z, creature_type):
+        self.x = x
+        self.y = 1.0  # Height
+        self.z = z
+        self.type = creature_type
+        self.speed = 0.02
+        self.active = False
+        self.last_move = pygame.time.get_ticks()
+        self.move_delay = random.randint(1000, 3000)  # Random movement timing
+        
+        # Animation properties
+        self.animation_state = 0.0
+        self.animation_speed = 0.05
+        
+    def update(self, player_x, player_z):
+        # Only move sometimes
+        current_time = pygame.time.get_ticks()
+        if current_time - self.last_move > self.move_delay:
+            # Calculate direction toward player (with some randomness)
+            if random.random() < 0.7:  # 70% chance to move toward player
+                dx = player_x - self.x
+                dz = player_z - self.z
+                dist = math.sqrt(dx*dx + dz*dz)
+                if dist > 0:
+                    dx /= dist
+                    dz /= dist
+                    
+                    # Add some randomness
+                    dx += random.uniform(-0.5, 0.5)
+                    dz += random.uniform(-0.5, 0.5)
+                    
+                    # Normalize again
+                    magnitude = math.sqrt(dx*dx + dz*dz)
+                    if magnitude > 0:
+                        dx /= magnitude
+                        dz /= magnitude
+                    
+                    self.x += dx * self.speed
+                    self.z += dz * self.speed
+            else:
+                # Random movement
+                self.x += random.uniform(-1, 1) * self.speed
+                self.z += random.uniform(-1, 1) * self.speed
+            
+            # Keep within bounds
+            self.x = max(6, min(WORLD_SIZE - 6, self.x))
+            self.z = max(6, min(WORLD_SIZE - 6, self.z))
+            
+            self.last_move = current_time
+            self.move_delay = random.randint(1000, 3000)
+        
+        # Update animation
+        self.animation_state += self.animation_speed
+        if self.animation_state > 1.0:
+            self.animation_state = 0.0
+
+# Create the three distinct creatures
+creatures = [
+    Creature(arch_center_x + random.randint(5, 10), arch_center_z + random.randint(5, 10), "sentinel"),
+    Creature(arch_center_x - random.randint(10, 15), arch_center_z + random.randint(-15, 15), "stalker"),
+    Creature(arch_center_x + random.randint(15, 25), arch_center_z - random.randint(15, 25), "watcher")
+]
+
+# Arch crossing state
+door_crossed = False
+
+# Fog parameters
+fog_density = 0.03
+fog_color = (0.05, 0.05, 0.1, 1.0)  # Slight blue tint for atmosphere
+
+# Tree parameters - for more detailed trees
+class Tree:
+    def __init__(self, x, z, height=None, width=None):
+        self.x = x
+        self.z = z
+        self.height = height if height else random.uniform(3.0, 5.0)
+        self.width = width if width else random.uniform(0.5, 1.0)
+        self.rotation = random.uniform(0, 360)
+        # Different types of trees
+        self.type = random.choice(["pine", "oak", "dead"])
+
+# Generate trees along the perimeter
+trees = []
+for _ in range(300):  # Generate 300 trees
+    # Place along the perimeter
+    if random.random() < 0.5:
+        # X perimeter
+        x = random.choice([random.randint(0, 4), random.randint(WORLD_SIZE-5, WORLD_SIZE-1)])
+        z = random.randint(0, WORLD_SIZE-1)
+    else:
+        # Z perimeter
+        x = random.randint(0, WORLD_SIZE-1)
+        z = random.choice([random.randint(0, 4), random.randint(WORLD_SIZE-5, WORLD_SIZE-1)])
+    
+    trees.append(Tree(x, z))
+
+# Add some scattered trees in the interior
+for _ in range(50):
+    x = random.randint(10, WORLD_SIZE-10)
+    z = random.randint(10, WORLD_SIZE-10)
+    # Make sure it's not too close to the arch
+    if math.sqrt((x - arch_center_x)**2 + (z - arch_center_z)**2) > 15:
+        trees.append(Tree(x, z))
+
+def draw_tree(tree):
+    glPushMatrix()
+    glTranslatef(tree.x, 0, tree.z)
+    glRotatef(tree.rotation, 0, 1, 0)
+    
+    # Draw trunk
+    glBindTexture(GL_TEXTURE_2D, tree_texture)
+    glEnable(GL_TEXTURE_2D)
+    
+    glColor3f(0.3, 0.2, 0.1)  # Brown trunk
+    
+    glBegin(GL_QUADS)
+    # Front face
+    glTexCoord2f(0, 0); glVertex3f(-tree.width/2, 0, -tree.width/2)
+    glTexCoord2f(1, 0); glVertex3f(tree.width/2, 0, -tree.width/2)
+    glTexCoord2f(1, 1); glVertex3f(tree.width/2, tree.height, -tree.width/2)
+    glTexCoord2f(0, 1); glVertex3f(-tree.width/2, tree.height, -tree.width/2)
+    
+    # Back face
+    glTexCoord2f(0, 0); glVertex3f(-tree.width/2, 0, tree.width/2)
+    glTexCoord2f(1, 0); glVertex3f(tree.width/2, 0, tree.width/2)
+    glTexCoord2f(1, 1); glVertex3f(tree.width/2, tree.height, tree.width/2)
+    glTexCoord2f(0, 1); glVertex3f(-tree.width/2, tree.height, tree.width/2)
+    
+    # Left face
+    glTexCoord2f(0, 0); glVertex3f(-tree.width/2, 0, -tree.width/2)
+    glTexCoord2f(1, 0); glVertex3f(-tree.width/2, 0, tree.width/2)
+    glTexCoord2f(1, 1); glVertex3f(-tree.width/2, tree.height, tree.width/2)
+    glTexCoord2f(0, 1); glVertex3f(-tree.width/2, tree.height, -tree.width/2)
+    
+    # Right face
+    glTexCoord2f(0, 0); glVertex3f(tree.width/2, 0, -tree.width/2)
+    glTexCoord2f(1, 0); glVertex3f(tree.width/2, 0, tree.width/2)
+    glTexCoord2f(1, 1); glVertex3f(tree.width/2, tree.height, tree.width/2)
+    glTexCoord2f(0, 1); glVertex3f(tree.width/2, tree.height, -tree.width/2)
+    glEnd()
+    
+    glDisable(GL_TEXTURE_2D)
+    
+    # Draw leaves/branches based on tree type
+    if tree.type == "pine":
+        glColor3f(0.05, 0.2, 0.05)  # Dark green for pine needles
+        
+        # Simple pyramid for pine tree
+        for i in range(3):  # Three levels of branches
+            y_pos = tree.height * (0.5 + 0.2 * i)
+            size = tree.width * 2 * (1.0 - 0.3 * i)
+            
+            glBegin(GL_TRIANGLES)
+            # Four sides of the pyramid
+            glVertex3f(0, y_pos + tree.height * 0.2, 0)  # Top
+            glVertex3f(-size/2, y_pos, -size/2)
+            glVertex3f(size/2, y_pos, -size/2)
+            
+            glVertex3f(0, y_pos + tree.height * 0.2, 0)  # Top
+            glVertex3f(size/2, y_pos, -size/2)
+            glVertex3f(size/2, y_pos, size/2)
+            
+            glVertex3f(0, y_pos + tree.height * 0.2, 0)  # Top
+            glVertex3f(size/2, y_pos, size/2)
+            glVertex3f(-size/2, y_pos, size/2)
+            
+            glVertex3f(0, y_pos + tree.height * 0.2, 0)  # Top
+            glVertex3f(-size/2, y_pos, size/2)
+            glVertex3f(-size/2, y_pos, -size/2)
+            glEnd()
+    
+    elif tree.type == "oak":
+        # Oak trees have a more rounded canopy
+        glColor3f(0.1, 0.3, 0.1)  # Slightly lighter green for oak leaves
+        
+        # Draw a simple sphere-like shape for the canopy
+        y_pos = tree.height * 0.7
+        size = tree.width * 2.5
+        
+        # Draw a basic octahedron
+        glBegin(GL_TRIANGLES)
+        # Top pyramid
+        glVertex3f(0, y_pos + size/2, 0)  # Top
+        glVertex3f(size/2, y_pos, 0)
+        glVertex3f(0, y_pos, size/2)
+        
+        glVertex3f(0, y_pos + size/2, 0)  # Top
+        glVertex3f(0, y_pos, size/2)
+        glVertex3f(-size/2, y_pos, 0)
+        
+        glVertex3f(0, y_pos + size/2, 0)  # Top
+        glVertex3f(-size/2, y_pos, 0)
+        glVertex3f(0, y_pos, -size/2)
+        
+        glVertex3f(0, y_pos + size/2, 0)  # Top
+        glVertex3f(0, y_pos, -size/2)
+        glVertex3f(size/2, y_pos, 0)
+        
+        # Bottom pyramid
+        glVertex3f(0, y_pos - size/2, 0)  # Bottom
+        glVertex3f(size/2, y_pos, 0)
+        glVertex3f(0, y_pos, size/2)
+        
+        glVertex3f(0, y_pos - size/2, 0)  # Bottom
+        glVertex3f(0, y_pos, size/2)
+        glVertex3f(-size/2, y_pos, 0)
+        
+        glVertex3f(0, y_pos - size/2, 0)  # Bottom
+        glVertex3f(-size/2, y_pos, 0)
+        glVertex3f(0, y_pos, -size/2)
+        
+        glVertex3f(0, y_pos - size/2, 0)  # Bottom
+        glVertex3f(0, y_pos, -size/2)
+        glVertex3f(size/2, y_pos, 0)
+        glEnd()
+    
+    # For dead trees, no leaves are drawn
+    
+    glPopMatrix()
+
+def draw_arch():
+    # Draw the rainbow arch using OpenGL
+    glPushMatrix()
+    
+    # Position the arch
+    glTranslatef(arch_center_x, 0, arch_center_z)
+    
+    # Bind the rainbow texture
+    glBindTexture(GL_TEXTURE_2D, arch_texture)
+    glEnable(GL_TEXTURE_2D)
+    
+    # Material properties for the arch (slightly glowing)
+    glMaterialfv(GL_FRONT, GL_AMBIENT, [0.4, 0.4, 0.6, 1.0])
+    glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.8, 0.8, 1.0, 1.0])
+    glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
+    glMaterialf(GL_FRONT, GL_SHININESS, 100.0)
+    
+    # Draw left pillar
+    glPushMatrix()
+    glTranslatef(-arch_width/2, 0, 0)
+    glScalef(0.5, arch_height, 0.5)
+    
+    glBegin(GL_QUADS)
+    # Front face
+    glTexCoord2f(0, 0); glVertex3f(-0.5, 0, -0.5)
+    glTexCoord2f(1, 0); glVertex3f(0.5, 0, -0.5)
+    glTexCoord2f(1, 1); glVertex3f(0.5, 1, -0.5)
+    glTexCoord2f(0, 1); glVertex3f(-0.5, 1, -0.5)
+    
+    # Back face
+    glTexCoord2f(0, 0); glVertex3f(-0.5, 0, 0.5)
+    glTexCoord2f(1, 0); glVertex3f(0.5, 0, 0.5)
+    glTexCoord2f(1, 1); glVertex3f(0.5, 1, 0.5)
+    glTexCoord2f(0, 1); glVertex3f(-0.5, 1, 0.5)
+    
+    # Left face
+    glTexCoord2f(0, 0); glVertex3f(-0.5, 0, -0.5)
+    glTexCoord2f(1, 0); glVertex3f(-0.5, 0, 0.5)
+    glTexCoord2f(1, 1); glVertex3f(-0.5, 1, 0.5)
+    glTexCoord2f(0, 1); glVertex3f(-0.5, 1, -0.5)
+    
+    # Right face
+    glTexCoord2f(0, 0); glVertex3f(0.5, 0, -0.5)
+    glTexCoord2f(1, 0); glVertex3f(0.5, 0, 0.5)
+    glTexCoord2f(1, 1); glVertex3f(0.5, 1, 0.5)
+    glTexCoord2f(0, 1); glVertex3f(0.5, 1, -0.5)
+    glEnd()
+    glPopMatrix()
+    
+    # Draw right pillar
+    glPushMatrix()
+    glTranslatef(arch_width/2, 0, 0)
+    glScalef(0.5, arch_height, 0.5)
+    
+    glBegin(GL_QUADS)
+    # Front face
+    glTexCoord2f(0, 0); glVertex3f(-0.5, 0, -0.5)
+    glTexCoord2f(1, 0); glVertex3f(0.5, 0, -0.5)
+    glTexCoord2f(1, 1); glVertex3f(0.5, 1, -0.5)
+    glTexCoord2f(0, 1); glVertex3f(-0.5, 1, -0.5)
+    
+    # Back face
+    glTexCoord2f(0, 0); glVertex3f(-0.5, 0, 0.5)
+    glTexCoord2f(1, 0); glVertex3f(0.5, 0, 0.5)
+    glTexCoord2f(1, 1); glVertex3f(0.5, 1, 0.5)
+    glTexCoord2f(0, 1); glVertex3f(-0.5, 1, 0.5)
+    
+    # Left face
+    glTexCoord2f(0, 0); glVertex3f(-0.5, 0, -0.5)
+    glTexCoord2f(1, 0); glVertex3f(-0.5, 0, 0.5)
+    glTexCoord2f(1, 1); glVertex3f(-0.5, 1, 0.5)
+    glTexCoord2f(0, 1); glVertex3f(-0.5, 1, -0.5)
+    
+    # Right face
+    glTexCoord2f(0, 0); glVertex3f(0.5, 0, -0.5)
+    glTexCoord2f(1, 0); glVertex3f(0.5, 0, 0.5)
+    glTexCoord2f(1, 1); glVertex3f(0.5, 1, 0.5)
+    glTexCoord2f(0, 1); glVertex3f(0.5, 1, -0.5)
+    glEnd()
+    glPopMatrix()
+    
+    # Draw top arch
+    glPushMatrix()
+    glTranslatef(0, arch_height, 0)
+    
+    # Draw the top of the arch as a half-circle
+    num_segments = 20
+    glBegin(GL_QUAD_STRIP)
+    for i in range(num_segments + 1):
+        angle = math.pi * i / num_segments
+        x = arch_width * math.sin(angle) - arch_width/2
+        y = arch_height * math.cos(angle) / 2
+        
+        # Texture coordinates
+        tx = i / float(num_segments)
+        ty = 1.0 - abs(x) / arch_width  # Map based on position
+        
+        glTexCoord2f(tx, ty)
+        glVertex3f(x, y, -0.25)  # Front
+        glVertex3f(x, y, 0.25)   # Back
+    glEnd()
+    glPopMatrix()
+    
+    # Add some particle effects for the arch
+    if random.random() < 0.1:  # Only some frames to reduce overdraw
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_LIGHTING)
+        glEnable(GL_POINT_SMOOTH)
+        glPointSize(3.0)
+        
+        glBegin(GL_POINTS)
+        for _ in range(20):
+            # Random positions around the arch
+            x = random.uniform(-arch_width/2, arch_width/2)
+            y = random.uniform(0, arch_height)
+            z = random.uniform(-0.5, 0.5)
+            
+            # Colors based on position (match rainbow)
+            position = y / arch_height
+            if position < 0.2:
+                glColor4f(0.7, 0.0, 0.9, random.uniform(0.3, 0.7))  # Purple
+            elif position < 0.4:
+                glColor4f(0.9, 0.0, 0.2, random.uniform(0.3, 0.7))  # Red
+            elif position < 0.6:
+                glColor4f(0.9, 0.5, 0.0, random.uniform(0.3, 0.7))  # Orange
+            elif position < 0.8:
+                glColor4f(0.2, 0.8, 0.2, random.uniform(0.3, 0.7))  # Green
+            else:
+                glColor4f(0.0, 0.2, 0.9, random.uniform(0.3, 0.7))  # Blue
+                
+            glVertex3f(x, y, z)
+        glEnd()
+        
+        glDisable(GL_POINT_SMOOTH)
+        glEnable(GL_LIGHTING)
+    
+    glDisable(GL_TEXTURE_2D)
+    glPopMatrix()
+
+def draw_creature(creature):
+    glPushMatrix()
+    glTranslatef(creature.x, creature.y, creature.z)
+    
+    # Orient toward player
+    dx = player_pos[0] - creature.x
+    dz = player_pos[2] - creature.z
+    angle = math.degrees(math.atan2(dz, dx))
+    glRotatef(angle, 0, 1, 0)
+    
+    # Animation
+    anim = math.sin(creature.animation_state * math.pi * 2) * 0.2
+    
+    # Disable textures for creatures
+    glDisable(GL_TEXTURE_2D)
+    
+    # Use simple shapes instead of GLUT objects to avoid crashes
+    if creature.type == "sentinel":
+        # Tall, thin shape with red eyes
+        glColor3f(0.6, 0.1, 0.12)
+        
+        # Main body
+        glPushMatrix()
+        glScalef(0.5, 2.0 + anim, 0.5)
+        
+        # Draw a cube manually instead of using glutSolidCube
+        glBegin(GL_QUADS)
+        # Front face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Back face
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Left face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Right face
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        
+        # Top face
+        glVertex3f(-0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Bottom face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glEnd()
+        
+        glPopMatrix()
+        
+        # Head - use simple polygons instead of glutSolidSphere
+        glPushMatrix()
+        glTranslatef(0, 1.5 + anim, 0)
+        glScalef(0.7, 0.7, 0.7)
+        
+        # Draw sphere approximation using quads
+        radius = 0.5
+        stacks = 6
+        slices = 6
+        
+        for i in range(stacks):
+            lat0 = math.pi * (-0.5 + float(i) / stacks)
+            z0 = math.sin(lat0)
+            zr0 = math.cos(lat0)
+            
+            lat1 = math.pi * (-0.5 + float(i+1) / stacks)
+            z1 = math.sin(lat1)
+            zr1 = math.cos(lat1)
+            
+            glBegin(GL_QUAD_STRIP)
+            for j in range(slices + 1):
+                lng = 2 * math.pi * float(j) / slices
+                x = math.cos(lng)
+                y = math.sin(lng)
+                
+                # First point
+                glVertex3f(x * zr0 * radius, y * zr0 * radius, z0 * radius)
+                # Second point
+                glVertex3f(x * zr1 * radius, y * zr1 * radius, z1 * radius)
+            glEnd()
+        
+        # Red eyes
+        glColor3f(1.0, 0.0, 0.0)
+        glPushMatrix()
+        glTranslatef(-0.2, 0.1, 0.4)
+        # Simple quad for eye
+        glBegin(GL_QUADS)
+        glVertex3f(-0.1, -0.1, 0)
+        glVertex3f(0.1, -0.1, 0)
+        glVertex3f(0.1, 0.1, 0)
+        glVertex3f(-0.1, 0.1, 0)
+        glEnd()
+        glPopMatrix()
+        
+        glPushMatrix()
+        glTranslatef(0.2, 0.1, 0.4)
+        # Simple quad for eye
+        glBegin(GL_QUADS)
+        glVertex3f(-0.1, -0.1, 0)
+        glVertex3f(0.1, -0.1, 0)
+        glVertex3f(0.1, 0.1, 0)
+        glVertex3f(-0.1, 0.1, 0)
+        glEnd()
+        glPopMatrix()
+        glPopMatrix()
+        
+        # Arms
+        glColor3f(0.5, 0.1, 0.1)
+        
+        # Left arm
+        glPushMatrix()
+        glTranslatef(-0.4, 0.8, 0)
+        glRotatef(30 + anim * 20, 0, 0, 1)
+        glScalef(0.2, 1.0, 0.2)
+        # Draw cube manually
+        glBegin(GL_QUADS)
+        # Front face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Back face
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Left face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Right face
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        
+        # Top face
+        glVertex3f(-0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Bottom face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glEnd()
+        glPopMatrix()
+        
+        # Right arm (similar to left)
+        glPushMatrix()
+        glTranslatef(0.4, 0.8, 0)
+        glRotatef(-30 - anim * 20, 0, 0, 1)
+        glScalef(0.2, 1.0, 0.2)
+        glBegin(GL_QUADS)
+        # Same cube drawing code as left arm
+        # Front face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Back face
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Left face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Right face
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        
+        # Top face
+        glVertex3f(-0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Bottom face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glEnd()
+        glPopMatrix()
+        
+    elif creature.type == "stalker":
+        # Use simpler shapes for the stalker creature
+        glColor3f(0.16, 0.16, 0.24)
+        
+        # Main body
+        glPushMatrix()
+        glTranslatef(0, 0.3, 0)
+        glScalef(1.0, 0.7, 0.8)
+        
+        # Draw cube manually
+        glBegin(GL_QUADS)
+        # Same cube drawing code as before
+        # Front face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Back face
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Left face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        # Right face
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        
+        # Top face
+        glVertex3f(-0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        # Bottom face
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glEnd()
+        glPopMatrix()
+        
+        # Head
+        glPushMatrix()
+        glTranslatef(0, 0.7, 0.3)
+        glRotatef(20 + anim * 10, 1, 0, 0)
+        glScalef(0.8, 0.5, 0.8)
+        
+        # Draw simplified head with triangles
+        glBegin(GL_TRIANGLES)
+        # Top
+        glVertex3f(0, 0.5, 0)
+        glVertex3f(-0.5, 0, 0)
+        glVertex3f(0.5, 0, 0)
+        
+        # Front
+        glVertex3f(0, 0.5, 0)
+        glVertex3f(0.5, 0, 0)
+        glVertex3f(0, 0, 0.5)
+        
+        glVertex3f(0, 0.5, 0)
+        glVertex3f(-0.5, 0, 0)
+        glVertex3f(0, 0, 0.5)
+        
+        # Back
+        glVertex3f(0, 0.5, 0)
+        glVertex3f(0.5, 0, 0)
+        glVertex3f(0, 0, -0.5)
+        
+        glVertex3f(0, 0.5, 0)
+        glVertex3f(-0.5, 0, 0)
+        glVertex3f(0, 0, -0.5)
+        
+        # Bottom
+        glVertex3f(-0.5, 0, 0)
+        glVertex3f(0.5, 0, 0)
+        glVertex3f(0, 0, 0.5)
+        
+        glVertex3f(-0.5, 0, 0)
+        glVertex3f(0.5, 0, 0)
+        glVertex3f(0, 0, -0.5)
+        glEnd()
+        
+        # Yellow-green eyes
+        glColor3f(0.7, 0.9, 0.12)
+        glPushMatrix()
+        glTranslatef(-0.25, 0.1, 0.3)
+        glBegin(GL_QUADS)
+        glVertex3f(-0.1, -0.1, 0)
+        glVertex3f(0.1, -0.1, 0)
+        glVertex3f(0.1, 0.1, 0)
+        glVertex3f(-0.1, 0.1, 0)
+        glEnd()
+        glPopMatrix()
+        
+        glPushMatrix()
+        glTranslatef(0.25, 0.1, 0.3)
+        glBegin(GL_QUADS)
+        glVertex3f(-0.1, -0.1, 0)
+        glVertex3f(0.1, -0.1, 0)
+        glVertex3f(0.1, 0.1, 0)
+        glVertex3f(-0.1, 0.1, 0)
+        glEnd()
+        glPopMatrix()
+        glPopMatrix()
+        
+        # Arms/Claws
+        glColor3f(0.14, 0.14, 0.2)
+        
+        # Left arm
+        glPushMatrix()
+        glTranslatef(-0.6, 0.3, 0.1)
+        glRotatef(20 + anim * 30, 0, 0, 1)
+        glScalef(0.5, 0.2, 0.2)
+        # Draw a cube
+        glBegin(GL_QUADS)
+        # Same cube drawing code as before
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        
+        glVertex3f(-0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glEnd()
+        glPopMatrix()
+        
+        # Right arm
+        glPushMatrix()
+        glTranslatef(0.6, 0.3, 0.1)
+        glRotatef(-20 - anim * 30, 0, 0, 1)
+        glScalef(0.5, 0.2, 0.2)
+        # Draw a cube
+        glBegin(GL_QUADS)
+        # Same cube drawing code as before
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, 0.5)
+        
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        
+        glVertex3f(-0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, 0.5)
+        glVertex3f(0.5, 0.5, -0.5)
+        glVertex3f(-0.5, 0.5, -0.5)
+        
+        glVertex3f(-0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, 0.5)
+        glVertex3f(0.5, -0.5, -0.5)
+        glVertex3f(-0.5, -0.5, -0.5)
+        glEnd()
+        glPopMatrix()
+        
+    else:  # "watcher"
+        # Hooded figure with single glowing eye
+        glColor3f(0.08, 0.08, 0.12)
+        
+        # Draw a simplified watcher using basic shapes
+        # Body (triangle)
+        glBegin(GL_TRIANGLES)
+        glVertex3f(0, 1.5, 0)
+        glVertex3f(-0.8, 0, 0.5)
+        glVertex3f(0.8, 0, 0.5)
+        
+        glVertex3f(0, 1.5, 0)
+        glVertex3f(-0.8, 0, -0.5)
+        glVertex3f(0.8, 0, -0.5)
+        
+        glVertex3f(0, 1.5, 0)
+        glVertex3f(-0.8, 0, 0.5)
+        glVertex3f(-0.8, 0, -0.5)
+        
+        glVertex3f(0, 1.5, 0)
+        glVertex3f(0.8, 0, 0.5)
+        glVertex3f(0.8, 0, -0.5)
+        glEnd()
+        
+        # Head
+        glPushMatrix()
+        glTranslatef(0, 1.2, 0)
+        glColor3f(0.05, 0.05, 0.1)
+        
+        # Draw a simple octahedron for the head
+        glBegin(GL_TRIANGLES)
+        # Top half
+        glVertex3f(0, 0.3, 0)
+        glVertex3f(0.2, 0, 0.2)
+        glVertex3f(-0.2, 0, 0.2)
+        
+        glVertex3f(0, 0.3, 0)
+        glVertex3f(-0.2, 0, 0.2)
+        glVertex3f(-0.2, 0, -0.2)
+        
+        glVertex3f(0, 0.3, 0)
+        glVertex3f(-0.2, 0, -0.2)
+        glVertex3f(0.2, 0, -0.2)
+        
+        glVertex3f(0, 0.3, 0)
+        glVertex3f(0.2, 0, -0.2)
+        glVertex3f(0.2, 0, 0.2)
+        
+        # Bottom half
+        glVertex3f(0, -0.3, 0)
+        glVertex3f(0.2, 0, 0.2)
+        glVertex3f(-0.2, 0, 0.2)
+        
+        glVertex3f(0, -0.3, 0)
+        glVertex3f(-0.2, 0, 0.2)
+        glVertex3f(-0.2, 0, -0.2)
+        
+        glVertex3f(0, -0.3, 0)
+        glVertex3f(-0.2, 0, -0.2)
+        glVertex3f(0.2, 0, -0.2)
+        
+        glVertex3f(0, -0.3, 0)
+        glVertex3f(0.2, 0, -0.2)
+        glVertex3f(0.2, 0, 0.2)
+        glEnd()
+        
+        # Single glowing eye
+        glPushMatrix()
+        glTranslatef(0, 0, 0.25)
+        glColor4f(0.8, 0.8, 1.0, 0.7 + anim * 0.3)
+        
+        # Draw a simple quad for the eye
+        glBegin(GL_QUADS)
+        glVertex3f(-0.15, -0.15, 0)
+        glVertex3f(0.15, -0.15, 0)
+        glVertex3f(0.15, 0.15, 0)
+        glVertex3f(-0.15, 0.15, 0)
+        glEnd()
+        
+        # Inner eye glow
+        glColor4f(1.0, 1.0, 1.0, 0.9)
+        glBegin(GL_QUADS)
+        glVertex3f(-0.05, -0.05, 0.01)
+        glVertex3f(0.05, -0.05, 0.01)
+        glVertex3f(0.05, 0.05, 0.01)
+        glVertex3f(-0.05, 0.05, 0.01)
+        glEnd()
+        glPopMatrix()
+        
+        glPopMatrix()
+    
+    glEnable(GL_TEXTURE_2D)
+    glPopMatrix()
+
+def draw_scene():
+    # Set up fog
+    glFogi(GL_FOG_MODE, GL_EXP2)
+    glFogfv(GL_FOG_COLOR, fog_color)
+    glFogf(GL_FOG_DENSITY, fog_density)
+    glHint(GL_FOG_HINT, GL_NICEST)
+    glEnable(GL_FOG)
+    
+    # Set up lighting
+    light_position = [30.0, 20.0, 30.0, 1.0]
+    glLightfv(GL_LIGHT0, GL_POSITION, light_position)
+    
+    # Ambient light - darker for spooky feel
+    ambient_light = [0.2, 0.2, 0.25, 1.0]
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, ambient_light)
+    
+    # Set up camera
+    glLoadIdentity()
+    # Apply rotation - up/down (clamped) and left/right
+    glRotatef(player_rot[1], 1, 0, 0)
+    glRotatef(player_rot[0], 0, 1, 0)
+    # Apply translation (negative because we move the world, not the camera)
+    glTranslatef(-player_pos[0], -player_pos[1], -player_pos[2])
+    
+    # Draw floor (grass)
+    glBindTexture(GL_TEXTURE_2D, grass_texture)
+    glEnable(GL_TEXTURE_2D)
+    glColor3f(1.0, 1.0, 1.0)  # White for proper texture color
+    
+    glPushMatrix()
+    glBegin(GL_QUADS)
+    # Draw a large grass plane
+    glTexCoord2f(0, 0); glVertex3f(0, 0, 0)
+    glTexCoord2f(WORLD_SIZE//5, 0); glVertex3f(WORLD_SIZE, 0, 0)
+    glTexCoord2f(WORLD_SIZE//5, WORLD_SIZE//5); glVertex3f(WORLD_SIZE, 0, WORLD_SIZE)
+    glTexCoord2f(0, WORLD_SIZE//5); glVertex3f(0, 0, WORLD_SIZE)
+    glEnd()
+    glPopMatrix()
+    
+    # Draw trees
+    for tree in trees:
+        # Check if tree is within visible range to improve performance
+        dx = tree.x - player_pos[0]
+        dz = tree.z - player_pos[2]
+        dist = math.sqrt(dx*dx + dz*dz)
+        
+        if dist < MAX_DEPTH:  # Only draw trees within view distance
+            draw_tree(tree)
+    
+    # Draw arch
+    draw_arch()
+    
+    # Draw creatures if they've been activated
+    if door_crossed:
+        for creature in creatures:
+            # Check if creature is within visible range
+            dx = creature.x - player_pos[0]
+            dz = creature.z - player_pos[2]
+            dist = math.sqrt(dx*dx + dz*dz)
+            
+            if dist < MAX_DEPTH:  # Only draw creatures within view distance
+                draw_creature(creature)
+    
+    # Draw simple 2D minimap
+    glDisable(GL_LIGHTING)
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_FOG)
+    glDisable(GL_TEXTURE_2D)
+    
+    # Switch to orthographic projection for 2D
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, SCREEN_WIDTH, SCREEN_HEIGHT, 0, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    
+    # Draw minimap background
+    map_size = 100
+    map_x = SCREEN_WIDTH - map_size - 10
+    map_y = 10
+    
+    # Draw map background
+    glColor4f(0, 0, 0, 0.7)
+    glBegin(GL_QUADS)
+    glVertex2f(map_x, map_y)
+    glVertex2f(map_x + map_size, map_y)
+    glVertex2f(map_x + map_size, map_y + map_size)
+    glVertex2f(map_x, map_y + map_size)
+    glEnd()
+    
+    # Draw perimeter on minimap
+    glColor4f(0.05, 0.2, 0.05, 0.9)
+    for x in range(WORLD_SIZE):
+        for z in range(WORLD_SIZE):
+            if world_map[z][x] == 1:  # Forest wall
+                mm_x = map_x + (x / WORLD_SIZE) * map_size
+                mm_y = map_y + (z / WORLD_SIZE) * map_size
+                mm_size = map_size / WORLD_SIZE
+                
+                glBegin(GL_QUADS)
+                glVertex2f(mm_x, mm_y)
+                glVertex2f(mm_x + mm_size, mm_y)
+                glVertex2f(mm_x + mm_size, mm_y + mm_size)
+                glVertex2f(mm_x, mm_y + mm_size)
+                glEnd()
+    
+    # Draw arch on minimap
+    mm_arch_x = map_x + (arch_center_x / WORLD_SIZE) * map_size
+    mm_arch_z = map_y + (arch_center_z / WORLD_SIZE) * map_size
+    mm_arch_size = 3
+    
+    # Draw arch as a bright marker
+    glColor4f(0.7, 0.2, 0.9, 1.0)
+    glBegin(GL_QUADS)
+    glVertex2f(mm_arch_x - mm_arch_size, mm_arch_z - mm_arch_size)
+    glVertex2f(mm_arch_x + mm_arch_size, mm_arch_z - mm_arch_size)
+    glVertex2f(mm_arch_x + mm_arch_size, mm_arch_z + mm_arch_size)
+    glVertex2f(mm_arch_x - mm_arch_size, mm_arch_z + mm_arch_size)
+    glEnd()
+    
+    # Draw creatures on minimap if active
+    if door_crossed:
+        for creature in creatures:
+            mm_creature_x = map_x + (creature.x / WORLD_SIZE) * map_size
+            mm_creature_z = map_y + (creature.z / WORLD_SIZE) * map_size
+            
+            # Different colors for different creatures
+            if creature.type == "sentinel":
+                glColor4f(0.9, 0.1, 0.1, 0.8)
+            elif creature.type == "stalker":
+                glColor4f(0.6, 0.6, 0.1, 0.8)
+            else:  # watcher
+                glColor4f(0.4, 0.4, 1.0, 0.8)
+                
+            # Draw creature dot
+            glPointSize(4.0)
+            glBegin(GL_POINTS)
+            glVertex2f(mm_creature_x, mm_creature_z)
+            glEnd()
+    
+    # Draw player position on minimap
+    mm_player_x = map_x + (player_pos[0] / WORLD_SIZE) * map_size
+    mm_player_z = map_y + (player_pos[2] / WORLD_SIZE) * map_size
+    
+    # Player dot
+    glColor4f(1.0, 1.0, 1.0, 1.0)
+    glPointSize(3.0)
+    glBegin(GL_POINTS)
+    glVertex2f(mm_player_x, mm_player_z)
+    glEnd()
+    
+    # Player direction indicator
+    glColor4f(1.0, 1.0, 1.0, 0.8)
+    angle_rad = math.radians(player_rot[0])
+    dir_x = mm_player_x + math.sin(angle_rad) * 5
+    dir_z = mm_player_z - math.cos(angle_rad) * 5
+    
+    glBegin(GL_LINES)
+    glVertex2f(mm_player_x, mm_player_z)
+    glVertex2f(dir_x, dir_z)
+    glEnd()
+    
+    # Restore previous projection
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    
+    # Re-enable 3D settings
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+    if fog_density > 0:
+        glEnable(GL_FOG)
+
+def main():
+    global player_pos, player_rot, door_crossed
+    
+    running = True
+    
+    # Initialize mouse position
+    pygame.mouse.set_visible(False)
+    pygame.mouse.set_pos(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+    pygame.event.set_grab(True)  # Lock mouse to window
+    
+    # Use keyboard controls instead of mouse
+    use_keyboard_rotation = True
+    
+    while running:
+        # Handle events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == KEYDOWN:
+                if event.key == K_ESCAPE:
+                    running = False
+                    pygame.mouse.set_visible(True)
+                    pygame.event.set_grab(False)
+        
+        # Handle movement
+        keys = pygame.key.get_pressed()
+        
+        # Calculate movement vectors
+        move_speed = player_speed
+        rotation_speed = 2.0
+        
+        # Handle rotation with keyboard
+        if use_keyboard_rotation:
+            if keys[K_LEFT] or keys[K_a]:
+                player_rot[0] -= rotation_speed
+            if keys[K_RIGHT] or keys[K_d]:
+                player_rot[0] += rotation_speed
+        
+        # Normalize horizontal rotation
+        player_rot[0] %= 360
+        
+        # Forward vector
+        forward_x = math.sin(math.radians(player_rot[0]))
+        forward_z = -math.cos(math.radians(player_rot[0]))
+        
+        # Apply movement
+        new_x, new_y, new_z = player_pos
+        
+        if keys[K_UP] or keys[K_w]:  # Forward
+            new_x += forward_x * move_speed
+            new_z += forward_z * move_speed
+        if keys[K_DOWN] or keys[K_s]:  # Backward
+            new_x -= forward_x * move_speed
+            new_z -= forward_z * move_speed
+        
+        # Check for collisions with walls
+        if 5 < new_x < WORLD_SIZE - 5 and 5 < new_z < WORLD_SIZE - 5:
+            # Check if position is inside forest wall
+            grid_x, grid_z = int(new_x), int(new_z)
+            if grid_x >= 0 and grid_x < WORLD_SIZE and grid_z >= 0 and grid_z < WORLD_SIZE:
+                if world_map[grid_z][grid_x] != 1:  # Not a wall
+                    player_pos = [new_x, new_y, new_z]
+        
+        # Check if player has crossed through the arch
+        dx = player_pos[0] - arch_center_x
+        dz = player_pos[2] - arch_center_z
+        dist = math.sqrt(dx*dx + dz*dz)
+        
+        # Detect walking through the arch area
+        if dist < arch_width/2 and not door_crossed:
+            # Check if player is between the pillars
+            if abs(dx) < arch_width/2 - 0.5:
+                door_crossed = True
+                # Activate creatures
+                for creature in creatures:
+                    creature.active = True
+                
+                print("*whispers* They... have... returned...")
+                print("You feel a cold chill as you pass through the spectral arch.")
+                print("Three dark figures have appeared in the distance...")
+                
+                # Increase fog after crossing for a more eerie feel
+                global fog_density
+                fog_density = 0.05
+        
+        # Update creatures if active
+        if door_crossed:
+            for creature in creatures:
+                if creature.active:
+                    creature.update(player_pos[0], player_pos[2])
+        
+        # Clear the screen and depth buffer
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        
+        # Render the scene
+        draw_scene()
+        
+        # Update display
+        pygame.display.flip()
+        
+        # Cap at 60 FPS
+        clock.tick(60)
+    
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
